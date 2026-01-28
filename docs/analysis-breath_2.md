@@ -1,0 +1,61 @@
+# breath_2.wav 结果分析记录（VAD vs ZFF）
+
+日期：2026-01-28  
+执行者：Codex
+
+## 背景
+目标：对 `breath_2.wav` 做呼吸检测，对比两种方法：
+
+- A：`vad_no_zff`（silero-vad 前置，仅在非语音段内用谱特征找呼吸）
+- B：`zff_no_vad`（ZFF-like gating + 谱特征精筛）
+
+用户标注/主观判断：`breath_2.wav` 里共有 **5 段**呼吸声。
+
+## 复现命令与现象
+### A) VAD + no ZFF（默认阈值）
+```
+python breath_detect_two_versions.py .\breath_2.wav --mode vad_no_zff --vad_repo E:\Projects\silero-vad --vad_window non_speech --out_json vad_segments.json
+```
+现象：通常只输出 1 段（例如 10.184–10.374s）。
+
+### B) no VAD + ZFF（默认阈值）
+```
+python breath_detect_two_versions.py .\breath_2.wav --mode zff_no_vad --out_json zff_segments.json
+```
+现象：输出 0 段。
+
+## 原因分析
+### 1) 为什么 zff_no_vad 为 0 段？
+`zff_no_vad` 的第一步 gating 要求：
+- `alpha <= max_zff_energy`（默认 `2e-5`）
+- `beta <= max_zff_slope`（默认 `6e-5`）
+
+在 `breath_2.wav` 上，ZFF-like slope（beta）的最小值约为 **1.4e-4**，已经大于 `6e-5`，
+导致候选帧数量为 0，后续谱特征精筛完全不执行，因此最终为 0 段。
+
+结论：这是“阈值过严导致候选被全部过滤”的典型情况，并不等价于“没有呼吸”。
+
+### 2) 为什么 vad_no_zff 默认只出 1 段？
+在非语音段内，谱规则的四个条件里，真正起瓶颈的是：
+- `mid_low_ratio >= min_mid_low_ratio`（默认 1.2）
+
+对 `breath_2.wav` 的非语音帧统计显示：
+- 非语音帧里，`mid_low_ratio` 的中位数约 0.17，p90 约 0.62，只有极少数帧能达到 1.2；
+因此会导致召回偏低，只能检出最“像呼吸”的那一段。
+
+结论：该结果“更偏精确率”，但对你说的 5 段真值来说明显漏检。
+
+## 调参建议（以找回 5 段为目标）
+在 `breath_2.wav` 上，将 `min_mid_low_ratio` 放宽到 0.6 左右可以得到约 5 段候选：
+```
+python breath_detect_two_versions.py .\breath_2.wav --mode vad_no_zff --vad_repo E:\Projects\silero-vad --vad_window non_speech --min_mid_low_ratio 0.6 --min_flatness 0.35 --out_json vad_segments.json
+```
+
+注意：
+- `min_mid_low_ratio` 越低 → 召回更高，但误检也更可能上升；
+- 室内播客如果底噪偏 “hiss”，建议提高 `--min_flatness` 到 0.30~0.40 来抑制误检。
+
+## 结论（这个结果是否合适？能否正确识别 5 段？）
+- 以默认阈值运行：不合适（漏检明显），难以覆盖你说的 5 段。
+- 通过放宽 `min_mid_low_ratio`：可以把召回提升到接近 5 段，但仍需结合试听/标注核验误检情况。
+
