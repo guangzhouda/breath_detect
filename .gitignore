@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.codex/
+
+# local outputs
+out_*.wav
+out_*.flac
+vad_segments*.json
+zff_segments*.json
+
+# local sample audio (keep local by default)
+breath_*.wav
