@@ -5,7 +5,7 @@ import numpy as np
 import soundfile as sf
 import scipy.signal as sps
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 try:
     import webrtcvad  # type: ignore
@@ -124,6 +124,31 @@ def smooth_bool(x: np.ndarray, win: int) -> np.ndarray:
     return y > 0.5
 
 
+def _fill_short_gaps(mask: np.ndarray, max_gap: int) -> np.ndarray:
+    """将 True 片段之间的短 False 间隙填平，用于减少“一个呼吸被切成多个段”的情况。"""
+    if max_gap <= 0:
+        return mask
+    m = mask.copy()
+    n = len(m)
+    i = 0
+    while i < n:
+        if m[i]:
+            i += 1
+            continue
+        # 统计 False 段长度
+        j = i
+        while j < n and not m[j]:
+            j += 1
+        gap_len = j - i
+        if gap_len <= max_gap:
+            left_true = i - 1 >= 0 and m[i - 1]
+            right_true = j < n and m[j]
+            if left_true and right_true:
+                m[i:j] = True
+        i = j
+    return m
+
+
 # -----------------------------
 # Spectral features for breath (no ZFF)
 # -----------------------------
@@ -144,7 +169,7 @@ class BreathFeatCfg:
     max_spectral_var: float = 6.0  # spectral variance proxy (log-mag variance)
 
 
-def spectral_breath_score(frames: np.ndarray, cfg: BreathFeatCfg) -> Tuple[np.ndarray, dict]:
+def spectral_breath_features(frames: np.ndarray, cfg: BreathFeatCfg) -> Dict[str, np.ndarray]:
     # STFT per frame with rfft
     win = np.hanning(frames.shape[1]).astype(np.float32)
     X = np.fft.rfft(frames * win[None, :], axis=1)
@@ -176,6 +201,21 @@ def spectral_breath_score(frames: np.ndarray, cfg: BreathFeatCfg) -> Tuple[np.nd
     logmag = np.log(mag)
     spec_var = np.var(logmag, axis=1)
 
+    return {
+        "rms": rms,
+        "mid_low_ratio": mid_low_ratio,
+        "flatness": flatness,
+        "spec_var": spec_var,
+    }
+
+
+def spectral_breath_score(frames: np.ndarray, cfg: BreathFeatCfg) -> Tuple[np.ndarray, dict]:
+    aux = spectral_breath_features(frames, cfg)
+    rms = aux["rms"]
+    mid_low_ratio = aux["mid_low_ratio"]
+    flatness = aux["flatness"]
+    spec_var = aux["spec_var"]
+
     # breath candidate rule (frame-level)
     cand = (
         (rms >= cfg.min_rms) &
@@ -183,14 +223,27 @@ def spectral_breath_score(frames: np.ndarray, cfg: BreathFeatCfg) -> Tuple[np.nd
         (flatness >= cfg.min_flatness) &
         (spec_var <= cfg.max_spectral_var)
     )
-
-    aux = {
-        "rms": rms,
-        "mid_low_ratio": mid_low_ratio,
-        "flatness": flatness,
-        "spec_var": spec_var,
-    }
     return cand, aux
+
+
+def spectral_breath_cand_from_feats(
+    feats: Dict[str, np.ndarray],
+    cfg: BreathFeatCfg,
+    *,
+    min_rms: float,
+    min_mid_low_ratio: float
+) -> np.ndarray:
+    """从已计算好的谱特征生成帧级候选 mask（便于做自适应阈值/回退策略）。"""
+    rms = feats["rms"]
+    mid_low_ratio = feats["mid_low_ratio"]
+    flatness = feats["flatness"]
+    spec_var = feats["spec_var"]
+    return (
+        (rms >= min_rms) &
+        (mid_low_ratio >= min_mid_low_ratio) &
+        (flatness >= cfg.min_flatness) &
+        (spec_var <= cfg.max_spectral_var)
+    )
 
 
 # -----------------------------
@@ -301,7 +354,14 @@ def breath_detect_vad_no_zff(
     x: np.ndarray,
     vad_cfg: VADCfg,
     feat_cfg: BreathFeatCfg,
-    speech_intervals: Optional[List[Tuple[int, int]]] = None
+    speech_intervals: Optional[List[Tuple[int, int]]] = None,
+    auto_tune: bool = False,
+    auto_ratio_percentile: float = 90.0,
+    auto_ratio_min_percentile: float = 80.0,
+    auto_backoff_step: float = 5.0,
+    auto_rms_percentile: float = 20.0,
+    auto_rms_factor: float = 1.2,
+    debug: bool = False
 ) -> List[Tuple[int, int]]:
     if speech_intervals is None:
         speech_mask = webrtcvad_speech_mask(x, vad_cfg)
@@ -340,13 +400,50 @@ def breath_detect_vad_no_zff(
     frame_len = int(feat_cfg.sr * feat_cfg.frame_ms / 1000)
     hop = int(feat_cfg.sr * feat_cfg.hop_ms / 1000)
 
-    breath_intervals = []
+    # 预先在所有搜索窗口内计算特征（避免 auto 回退时重复做 FFT）
+    win_cache: List[Tuple[int, int, Dict[str, np.ndarray]]] = []
+    ratio_all: List[np.ndarray] = []
+    rms_all: List[np.ndarray] = []
     for ws, we in windows:
         seg = x[ws:we]
         if len(seg) < frame_len:
             continue
         frames = frame_signal(seg, frame_len, hop)
-        cand, _ = spectral_breath_score(frames, feat_cfg)
+        feats = spectral_breath_features(frames, feat_cfg)
+        win_cache.append((ws, we, feats))
+        ratio_all.append(feats["mid_low_ratio"])
+        rms_all.append(feats["rms"])
+
+    # --- auto：在当前音频上做“只放宽不收紧”的自适应阈值，并带回退（每段 non_speech 单独兜底） ---
+    ratio_thr_base = float(feat_cfg.min_mid_low_ratio)
+    min_rms_dyn = float(feat_cfg.min_rms)
+    if auto_tune and ratio_all:
+        ratio_cat = np.concatenate(ratio_all)
+        p = float(np.percentile(ratio_cat, auto_ratio_percentile))
+        ratio_thr_base = float(min(feat_cfg.min_mid_low_ratio, p))
+        if debug:
+            print(f"[auto] mid_low_ratio p{auto_ratio_percentile:.0f}={p:.3f} -> thr_base={ratio_thr_base:.3f} (cap={feat_cfg.min_mid_low_ratio})")
+
+    if auto_tune and rms_all:
+        rms_cat = np.concatenate(rms_all)
+        noise_rms = float(np.percentile(rms_cat, auto_rms_percentile))
+        min_rms_dyn = float(max(feat_cfg.min_rms, noise_rms * auto_rms_factor))
+        if debug:
+            print(f"[auto] rms noise(p{auto_rms_percentile:.0f})={noise_rms:.6f} -> min_rms={min_rms_dyn:.6f} (factor={auto_rms_factor})")
+
+    breath_intervals = []
+    for ws, we, feats in win_cache:
+        # 先用全局阈值检测
+        cand = spectral_breath_cand_from_feats(
+            feats,
+            feat_cfg,
+            min_rms=min_rms_dyn,
+            min_mid_low_ratio=ratio_thr_base
+        )
+
+        # 填平短间隙，减少“一个呼吸被切成多个段”
+        gap_frames = int(round((vad_cfg.merge_gap_ms / 1000.0) * feat_cfg.sr / hop))
+        cand = _fill_short_gaps(cand, max_gap=max(0, gap_frames))
 
         # convert frame cand -> sample intervals in seg
         cand_s = []
@@ -357,6 +454,39 @@ def breath_detect_vad_no_zff(
                 cand_s.append((ss, ee))
         cand_s = merge_intervals(cand_s, gap=int(vad_cfg.merge_gap_ms * feat_cfg.sr / 1000))
         cand_s = drop_short(cand_s, min_len=int(vad_cfg.min_breath_ms * feat_cfg.sr / 1000))
+
+        # auto 回退：如果这个 non_speech 段完全没有结果，但段内存在明显能量峰值，则单段放宽 ratio 再试一次
+        if auto_tune and not cand_s:
+            peak_rms = float(np.max(feats["rms"])) if len(feats["rms"]) else 0.0
+            # 没有“明显声音”的段直接跳过，避免在纯静音里为了“凑段”而误检
+            if peak_rms >= min_rms_dyn * 1.1:
+                p0 = float(auto_ratio_percentile)
+                p_min = float(auto_ratio_min_percentile)
+                step = float(max(1.0, auto_backoff_step))
+                p_try = p0
+                while p_try - step >= p_min and not cand_s:
+                    p_try -= step
+                    local_thr = float(min(feat_cfg.min_mid_low_ratio, np.percentile(feats["mid_low_ratio"], p_try)))
+                    cand2 = spectral_breath_cand_from_feats(
+                        feats,
+                        feat_cfg,
+                        min_rms=min_rms_dyn,
+                        min_mid_low_ratio=local_thr
+                    )
+                    cand2 = _fill_short_gaps(cand2, max_gap=max(0, gap_frames))
+                    cand_s2 = []
+                    for i, c in enumerate(cand2):
+                        if c:
+                            ss = i * hop
+                            ee = ss + frame_len
+                            cand_s2.append((ss, ee))
+                    cand_s2 = merge_intervals(cand_s2, gap=int(vad_cfg.merge_gap_ms * feat_cfg.sr / 1000))
+                    cand_s2 = drop_short(cand_s2, min_len=int(vad_cfg.min_breath_ms * feat_cfg.sr / 1000))
+                    if cand_s2:
+                        cand_s = cand_s2
+                        if debug:
+                            print(f"[auto] window {ws/feat_cfg.sr:.3f}-{we/feat_cfg.sr:.3f}s backoff: p{p_try:.0f} -> thr={local_thr:.3f}, segs={len(cand_s)}")
+                        break
         # shift back to full signal index
         breath_intervals.extend([(ws + s, ws + e) for s, e in cand_s])
 
@@ -495,11 +625,22 @@ if __name__ == "__main__":
     ap.add_argument("--mode", type=str, choices=["vad_no_zff", "zff_no_vad"], default="vad_no_zff")
     ap.add_argument("--out_wav", type=str, default="out_atten.wav")
     ap.add_argument("--out_json", type=str, default="breath_segments.json")
+    ap.add_argument("--out_json_events", type=str, default=None, help="输出合并后的呼吸事件（可选）")
     ap.add_argument("--atten_db", type=float, default=-10.0)
+    ap.add_argument("--debug", action="store_true", help="打印自适应阈值与统计信息")
 
     # Breath feature tuning (no ZFF)
     ap.add_argument("--min_flatness", type=float, default=0.25, help="谱平坦度下限（更大更严格）")
     ap.add_argument("--min_mid_low_ratio", type=float, default=1.2, help="(1-3.5k)/(0-1k) 能量比下限（更小更宽松）")
+    ap.add_argument("--auto", action="store_true", help="根据当前音频（在搜索窗口内）自动放宽阈值")
+    ap.add_argument("--auto_ratio_percentile", type=float, default=90.0, help="auto 模式下 ratio 分位数（如 90）")
+    ap.add_argument("--auto_ratio_min_percentile", type=float, default=80.0, help="auto 回退时允许降到的最小分位数（默认 80）")
+    ap.add_argument("--auto_backoff_step", type=float, default=5.0, help="auto 回退步长（分位数），默认 5")
+    ap.add_argument("--auto_rms_percentile", type=float, default=20.0, help="auto 模式下噪声 RMS 分位数（默认 20）")
+    ap.add_argument("--auto_rms_factor", type=float, default=1.2, help="auto 模式下 min_rms=噪声RMS*factor（默认 1.2）")
+    ap.add_argument("--min_breath_ms", type=int, default=60, help="最小呼吸段时长(ms)")
+    ap.add_argument("--merge_gap_ms", type=int, default=40, help="合并间隔(ms)，可减少一个呼吸被切成两段")
+    ap.add_argument("--event_merge_gap_ms", type=int, default=200, help="呼吸事件合并间隔(ms)，用于统计呼吸事件数")
 
     # VAD backend & params (only for mode=vad_no_zff)
     ap.add_argument("--vad_backend", type=str, choices=["silero", "webrtcvad"], default="silero")
@@ -529,7 +670,9 @@ if __name__ == "__main__":
             sr=sr,
             aggressiveness=2,
             window_mode=str(args.vad_window),
-            boundary_win_s=float(args.boundary_win_s)
+            boundary_win_s=float(args.boundary_win_s),
+            min_breath_ms=int(args.min_breath_ms),
+            merge_gap_ms=int(args.merge_gap_ms)
         )
 
         if args.vad_backend == "silero":
@@ -544,11 +687,47 @@ if __name__ == "__main__":
                 vad_repo=args.vad_repo
             )
             speech_intervals = silero_speech_intervals(x, silero_cfg)
-            segs = breath_detect_vad_no_zff(x, vad_cfg, feat_cfg, speech_intervals=speech_intervals)
+            segs = breath_detect_vad_no_zff(
+                x,
+                vad_cfg,
+                feat_cfg,
+                speech_intervals=speech_intervals,
+                auto_tune=bool(args.auto),
+                auto_ratio_percentile=float(args.auto_ratio_percentile),
+                auto_ratio_min_percentile=float(args.auto_ratio_min_percentile),
+                auto_backoff_step=float(args.auto_backoff_step),
+                auto_rms_percentile=float(args.auto_rms_percentile),
+                auto_rms_factor=float(args.auto_rms_factor),
+                debug=bool(args.debug)
+            )
         else:
-            segs = breath_detect_vad_no_zff(x, vad_cfg, feat_cfg)
+            segs = breath_detect_vad_no_zff(
+                x,
+                vad_cfg,
+                feat_cfg,
+                auto_tune=bool(args.auto),
+                auto_ratio_percentile=float(args.auto_ratio_percentile),
+                auto_ratio_min_percentile=float(args.auto_ratio_min_percentile),
+                auto_backoff_step=float(args.auto_backoff_step),
+                auto_rms_percentile=float(args.auto_rms_percentile),
+                auto_rms_factor=float(args.auto_rms_factor),
+                debug=bool(args.debug)
+            )
     else:
-        zff_cfg = ZFFCfg(sr=sr)
+        zff_cfg = ZFFCfg(sr=sr, merge_gap_ms=int(args.merge_gap_ms), min_breath_ms=int(args.min_breath_ms))
+        # auto 模式下，根据当前音频自适应 ZFF gating 阈值，避免出现“候选全被过滤”的情况
+        if args.auto:
+            z = zff_like_signal(x, zff_cfg)
+            frame_len = int(zff_cfg.sr * zff_cfg.frame_ms / 1000)
+            hop = int(zff_cfg.sr * zff_cfg.hop_ms / 1000)
+            frames = frame_signal(z, frame_len, hop)
+            alpha = np.mean(frames**2, axis=1)
+            beta = np.mean(np.abs(np.diff(frames, axis=1)), axis=1)
+            # 取低分位数作为阈值（挑选低激励区域）
+            zff_cfg.max_zff_energy = float(np.percentile(alpha, 10))
+            zff_cfg.max_zff_slope = float(np.percentile(beta, 10))
+            if args.debug:
+                print(f"[auto] zff_energy thr(p10)={zff_cfg.max_zff_energy:.3e}, zff_slope thr(p10)={zff_cfg.max_zff_slope:.3e}")
         segs = breath_detect_no_vad_with_zff(x, zff_cfg, feat_cfg)
 
     y = apply_fade_attenuation(x, segs, sr=sr, atten_db=args.atten_db, fade_ms=12.0)
@@ -560,6 +739,16 @@ if __name__ == "__main__":
             f, ensure_ascii=False, indent=2
         )
 
-    print(f"[OK] mode={args.mode} segments={len(segs)}")
+    events = merge_intervals(segs, gap=int(args.event_merge_gap_ms * sr / 1000))
+    if args.out_json_events:
+        with open(args.out_json_events, "w", encoding="utf-8") as f:
+            json.dump(
+                [{"start_s": s / sr, "end_s": e / sr, "dur_ms": (e - s) * 1000.0 / sr} for s, e in events],
+                f, ensure_ascii=False, indent=2
+            )
+
+    print(f"[OK] mode={args.mode} segments={len(segs)} events={len(events)}")
     print(f"     wrote: {args.out_wav}")
     print(f"     wrote: {args.out_json}")
+    if args.out_json_events:
+        print(f"     wrote: {args.out_json_events}")
