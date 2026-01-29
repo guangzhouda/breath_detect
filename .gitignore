@@ -6,8 +6,8 @@ __pycache__/
 # local outputs
 out_*.wav
 out_*.flac
-vad_segments*.json
-zff_segments*.json
+vad_*.json
+zff_*.json
 
 # local sample audio (keep local by default)
 breath_*.wav
