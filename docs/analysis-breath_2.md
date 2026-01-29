@@ -1,6 +1,6 @@
 # breath_2.wav 结果分析记录（VAD vs ZFF）
 
-日期：2026-01-28  
+日期：2026-01-29  
 执行者：Codex
 
 ## 背景
@@ -55,7 +55,23 @@ python breath_detect_two_versions.py .\breath_2.wav --mode vad_no_zff --vad_repo
 - `min_mid_low_ratio` 越低 → 召回更高，但误检也更可能上升；
 - 室内播客如果底噪偏 “hiss”，建议提高 `--min_flatness` 到 0.30~0.40 来抑制误检。
 
+## 自适应与“呼吸事件”输出
+为了避免每换一条音频就手动调 `min_mid_low_ratio`，`breath_detect_two_versions.py` 支持 `--auto`：
+- 先在所有搜索窗口内统计 `mid_low_ratio` 分布，取分位数（默认 p90）作为 **全局阈值上限**（并且不超过你给的 `--min_mid_low_ratio` 上限）；
+- 同时根据非语音窗口的 RMS 统计噪声基线，设置动态 `min_rms`（默认使用 p20 * 1.2）；
+- 如果某个 non-speech 段在全局阈值下完全检不出，但该段确实有“明显声音”，会对该段做 **分位数回退**（例如 p90→p85→p80），避免“某一段漏光”。
+
+同时支持 `--out_json_events` 输出合并后的“呼吸事件”（默认 `event_merge_gap_ms=200`），用于减少“一个呼吸被切成多个段”的情况。
+
+### breath_2.wav 在 auto 下的一个可复现结果
+```
+python breath_detect_two_versions.py .\breath_2.wav --mode vad_no_zff --vad_repo E:\Projects\silero-vad --vad_window non_speech --auto --out_json vad_segments.json --out_json_events vad_events.json --debug
+```
+现象：`segments=6 events=5`（events 更接近你说的 “5 段呼吸” 的统计口径）。
+
+如果你发现误检偏多：可以提高 `--auto_ratio_min_percentile`（例如 85/90）或提高 `--auto_rms_factor`（例如 1.3~1.5）让阈值更严格。
+
 ## 结论（这个结果是否合适？能否正确识别 5 段？）
 - 以默认阈值运行：不合适（漏检明显），难以覆盖你说的 5 段。
 - 通过放宽 `min_mid_low_ratio`：可以把召回提升到接近 5 段，但仍需结合试听/标注核验误检情况。
-
+- 在 `--auto` 模式下：更倾向于“不同 non-speech 段都能检到候选”，并用 events 口径减少切分，整体更适合作为通用默认方案；是否与标注 5 段完全一致，仍建议用输出时间戳对照核验。
